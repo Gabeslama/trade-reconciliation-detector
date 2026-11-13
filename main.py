@@ -1,110 +1,135 @@
-import anthropic
+"""
+AI-Powered Trade Reconciliation Discrepancy Detector
+
+What this script does, start to finish:
+  1. Loads two transaction files (book A and book B) from the data/ folder.
+  2. Finds reconciliation "breaks": trades whose amounts differ by more than a
+     small tolerance, or trades that exist in only one of the two books.
+  3. Sends each break to the Anthropic API, which returns a plain-English
+     analysis as JSON: break_type, likely_cause, severity, suggested_action.
+  4. Writes everything to output/report.csv.
+"""
+
 import json
-from dotenv import load_dotenv
-import pandas as pd
 import os
 
-load_dotenv(r"C:\Users\gabes\OneDrive\Desktop\Python Practice - Claude\.env")
+import anthropic
+import pandas as pd
+from dotenv import load_dotenv
 
-client = anthropic.Anthropic()
+# load_dotenv() with no argument looks for a .env file starting in the current
+# folder. No hardcoded personal path, so the script runs on anyone's machine.
+load_dotenv()
+
+# Settings kept in one place so they're easy to find and change.
+# The model can be overridden from .env without touching the code.
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+TOLERANCE = 0.01  # differences of a cent or less are treated as rounding, not breaks
+
+# The client reads ANTHROPIC_API_KEY from the environment (loaded from .env above).
+# timeout: give up on a single call after 30 seconds instead of hanging.
+# max_retries: the SDK automatically retries rate limits (429) and server errors (5xx).
+client = anthropic.Anthropic(timeout=30.0, max_retries=3)
 
 
 class ReconciliationReport:
     """Compares two transaction DataFrames and identifies reconciliation breaks."""
 
-    def __init__(self, df_a, df_b):
+    def __init__(self, df_a, df_b, tolerance=TOLERANCE):
+        # Fail loudly with a clear message instead of calling exit() inside a class.
+        if df_a.empty or df_b.empty:
+            raise ValueError("Both input files must contain at least one trade.")
         self.df_a = df_a
         self.df_b = df_b
+        self.tolerance = tolerance
+        self.breaks = None
 
     def find_breaks(self):
-        """Merges DataFrames and returns rows where amounts differ or are missing."""
-        total = self.df_a.merge(self.df_b, how='outer', on='trade_id')
-        diff = total[total['amount_x'] != total['amount_y']]
-        self.breaks = diff
-        return diff
+        """Returns the rows that don't reconcile, with a break_reason column."""
+        # Outer merge keeps trades that appear in only one book.
+        # suffixes make the columns read amount_a / amount_b instead of _x / _y.
+        merged = self.df_a.merge(
+            self.df_b, how="outer", on="trade_id", suffixes=("_a", "_b")
+        )
+
+        missing_in_a = merged["amount_a"].isna()
+        missing_in_b = merged["amount_b"].isna()
+        # Compare with a tolerance, never with exact != on floats.
+        amount_mismatch = (merged["amount_a"] - merged["amount_b"]).abs() > self.tolerance
+
+        # Rule-based reason, decided by the code before any AI is involved.
+        merged["break_reason"] = None
+        merged.loc[amount_mismatch, "break_reason"] = "Amount mismatch"
+        merged.loc[missing_in_a, "break_reason"] = "Missing in book A"
+        merged.loc[missing_in_b, "break_reason"] = "Missing in book B"
+
+        is_break = missing_in_a | missing_in_b | amount_mismatch
+        self.breaks = merged[is_break].reset_index(drop=True)
+        return self.breaks
 
     def summary(self):
-        """Returns the total dollar value of all breaks."""
-        self.breaks = self.breaks.fillna(0)
-        self.breaks['diff'] = self.breaks['amount_x'] - self.breaks['amount_y']
-        self.breaks['diff'] = abs(self.breaks['diff'])
-        return self.breaks['diff'].sum()
+        """Returns the total absolute difference across trades found in both books."""
+        both = self.breaks.dropna(subset=["amount_a", "amount_b"])
+        return (both["amount_a"] - both["amount_b"]).abs().sum()
 
-    def export_report(self, file_name):
-        """Exports the breaks DataFrame to a CSV file."""
-        return self.breaks.to_csv(file_name, index=False)
-
-
-def find_breaks(a, b):
-    """Finds discrepancies between two transaction DataFrames."""
-    if a.empty or b.empty:
-        print('Empty DataFrames')
-        exit()
-    total = a.merge(b, how='outer', on='trade_id')
-    diff = total[total['amount_x'] != total['amount_y']]
-    return diff
+    def export_report(self, df, file_name):
+        """Writes a DataFrame to CSV, creating the output folder if needed."""
+        os.makedirs(os.path.dirname(file_name), exist_ok=True)
+        df.to_csv(file_name, index=False)
 
 
 def call_api(row):
-    """Calls the Anthropic API for a single break row and returns parsed JSON."""
+    """Asks the model to analyze one break. Returns a dict, or None if parsing fails."""
     prompt = (
-        f"You are a financial data analyst. Here is a trade reconciliation break: "
-        f"trade_id: {row['trade_id']}, "
-        f"amount_x: {row['amount_x']}, "
-        f"amount_y: {row['amount_y']}. "
-        f"Explain what the break_type, likely_cause, severity, and suggested_action. "
-        f"ONLY RESPOND IN JSON FOR THESE FIELDS."
+        "You are a financial data analyst reviewing a trade reconciliation break.\n"
+        f"trade_id: {row['trade_id']}\n"
+        f"amount in book A: {row['amount_a']}\n"
+        f"amount in book B: {row['amount_b']}\n"
+        f"rule-based reason: {row['break_reason']}\n\n"
+        "Respond with ONLY a JSON object with exactly these keys: "
+        '"break_type", "likely_cause", "severity" (Low, Medium or High), '
+        '"suggested_action". No other text.'
     )
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1000,
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
+        model=MODEL,
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}],
     )
 
+    raw = message.content[0].text
+    # Models sometimes wrap JSON in ```json fences; strip them before parsing.
+    cleaned = raw.replace("```json", "").replace("```", "").strip()
     try:
-        raw = message.content[0].text
-        cleaned = raw.replace("```json", "").replace("```", "").strip()
-        parsed = json.loads(cleaned)
-        return parsed
+        return json.loads(cleaned)
     except json.JSONDecodeError:
-        print(f"Error: API did not return valid JSON for trade {row['trade_id']}")
-        print(raw)
+        print(f"Warning: response for {row['trade_id']} was not valid JSON:\n{raw}")
         return None
 
 
+FALLBACK = {
+    "break_type": "Unknown",
+    "likely_cause": "AI response could not be parsed",
+    "severity": "Unknown",
+    "suggested_action": "Manual review required",
+}
+
+
 if __name__ == "__main__":
+    book_a = pd.read_csv("data/book_a.csv")
+    book_b = pd.read_csv("data/book_b.csv")
 
-    # Load input files
-    book_a = pd.read_csv('data/book_a.csv')
-    book_b = pd.read_csv('data/book_b.csv')
+    report = ReconciliationReport(book_a, book_b)
+    breaks = report.find_breaks()
+    print(f"Found {len(breaks)} breaks. Total amount difference: {report.summary():,.2f}")
 
-    # Find breaks
-    diff = find_breaks(book_a, book_b)
-    print(f"Found {len(diff)} breaks.")
-
-    # Call API for each break
+    # to_dict("records") gives one plain dict per row: simpler than iterrows().
     results = []
-    for i, row in diff.iterrows():
+    for row in breaks.to_dict("records"):
         print(f"Analyzing break: {row['trade_id']}...")
-        parsed = call_api(row)
-        if parsed:
-            results.append(parsed)
-        else:
-            results.append({
-                'break_type': 'Unknown',
-                'likely_cause': 'API parsing failed',
-                'severity': 'Unknown',
-                'suggested_action': 'Manual review required'
-            })
+        results.append(call_api(row) or FALLBACK)
 
-    # Add AI results as new columns
-    results_df = pd.DataFrame(results)
-    diff = pd.concat([diff.reset_index(drop=True), results_df.reset_index(drop=True)], axis=1)
-
-    # Export report
-    os.makedirs('output', exist_ok=True)
-    diff.to_csv('output/report.csv', index=False)
+    # Put the AI columns next to the break rows (same order, same length).
+    final = pd.concat([breaks, pd.DataFrame(results)], axis=1)
+    report.export_report(final, "output/report.csv")
     print("Report exported to output/report.csv")
